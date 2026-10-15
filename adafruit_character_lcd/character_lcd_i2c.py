@@ -26,6 +26,12 @@ Implementation Notes
 * Adafruit's Bus Device library:
   https://github.com/adafruit/Adafruit_CircuitPython_BusDevice
 
+* Adafruit's MCP230xx library (for the default MCP23008 backpack):
+  https://github.com/adafruit/Adafruit_CircuitPython_MCP230xx
+
+* Adafruit's PCF8574 library (for PCF8574 backpacks):
+  https://github.com/adafruit/Adafruit_CircuitPython_PCF8574
+
 """
 
 import time
@@ -37,28 +43,22 @@ try:
 except ImportError:
     pass
 
-from adafruit_mcp230xx.mcp23008 import MCP23008
-from adafruit_pcf8574 import PCF8574
-
 from adafruit_character_lcd.character_lcd import Character_LCD_Mono
+from adafruit_character_lcd.i2c_expanders import I2C_Expander
+from adafruit_character_lcd.i2c_expanders.mcp23008 import MCP23008_Expander
 
 __version__ = "0.0.0+auto.0"
 __repo__ = "https://github.com/adafruit/Adafruit_CircuitPython_CharLCD.git"
-
-
-class I2C_Expander:
-    """
-    I2C Expander ICs
-    """
-
-    MCP23008 = "MCP23008"
-    PCF8574 = "PCF8574"
 
 
 class Character_LCD_I2C(Character_LCD_Mono):
     """Character LCD connected to I2C/SPI backpack using its I2C connection.
     This is a subclass of `Character_LCD_Mono` and implements all the same
     functions and functionality.
+
+    By default, the Adafruit backpack with an MCP23008 expander is used.
+    Other backpacks can be used by passing an expander wrapper from
+    `adafruit_character_lcd.i2c_expanders`, optionally with a custom pin mapping.
 
     To use, import and initialise as follows:
 
@@ -69,6 +69,17 @@ class Character_LCD_I2C(Character_LCD_Mono):
 
         i2c = board.I2C()  # uses board.SCL and board.SDA
         lcd = Character_LCD_I2C(i2c, 16, 2)
+
+    or, for a backpack with a PCF8574 expander:
+
+    .. code-block:: python
+
+        import board
+        from adafruit_character_lcd.character_lcd_i2c import Character_LCD_I2C
+        from adafruit_character_lcd.i2c_expanders.pcf8574 import PCF8574_Expander
+
+        i2c = board.I2C()  # uses board.SCL and board.SDA
+        lcd = Character_LCD_I2C(i2c, 16, 2, expander=PCF8574_Expander(i2c))
     """
 
     def __init__(
@@ -78,50 +89,42 @@ class Character_LCD_I2C(Character_LCD_Mono):
         lines: int,
         address: Optional[int] = None,
         backlight_inverted: bool = False,
-        expander: I2C_Expander = I2C_Expander.MCP23008,
+        expander: Optional[I2C_Expander] = None,
     ) -> None:
         """Initialize character LCD connected to backpack using I2C connection
         on the specified I2C bus with the specified number of columns and
         lines on the display. Optionally specify if backlight is inverted.
+
+        If ``expander`` is given, it is used to drive the LCD and ``i2c`` and
+        ``address`` are ignored. Otherwise an MCP23008 expander on ``i2c`` at
+        ``address`` (if specified) is used.
         """
 
-        if expander == I2C_Expander.MCP23008:
+        if expander is None:
             if address:
-                self.expander = MCP23008(i2c, address=address)
+                expander = MCP23008_Expander(i2c, address=address)
             else:
-                self.expander = MCP23008(i2c)
+                expander = MCP23008_Expander(i2c)
+        self.expander = expander
 
-            super().__init__(
-                self.expander.get_pin(1),  # reset
-                self.expander.get_pin(2),  # enable
-                self.expander.get_pin(3),  # data line 4
-                self.expander.get_pin(4),  # data line 5
-                self.expander.get_pin(5),  # data line 6
-                self.expander.get_pin(6),  # data line 7
-                columns,
-                lines,
-                backlight_pin=self.expander.get_pin(7),
-                backlight_inverted=backlight_inverted,
-            )
+        # Lookup table mapping a 4-bit nibble to the expander data line bits.
+        self._nibble_bits = [
+            sum(((nibble >> i) & 1) << pin for i, pin in enumerate(expander.data_pins))
+            for nibble in range(16)
+        ]
 
-        elif expander == I2C_Expander.PCF8574:
-            if address:
-                self.expander = PCF8574(i2c, address=address)
-            else:
-                self.expander = PCF8574(i2c)
-
-            super().__init__(
-                self.expander.get_pin(0),  # reset
-                self.expander.get_pin(2),  # enable
-                self.expander.get_pin(4),  # data line 4
-                self.expander.get_pin(5),  # data line 5
-                self.expander.get_pin(6),  # data line 6
-                self.expander.get_pin(7),  # data line 7
-                columns,
-                lines,
-                backlight_pin=self.expander.get_pin(3),
-                backlight_inverted=backlight_inverted,
-            )
+        super().__init__(
+            expander.get_pin(expander.reset_pin),
+            expander.get_pin(expander.enable_pin),
+            expander.get_pin(expander.data_pins[0]),  # data line 4
+            expander.get_pin(expander.data_pins[1]),  # data line 5
+            expander.get_pin(expander.data_pins[2]),  # data line 6
+            expander.get_pin(expander.data_pins[3]),  # data line 7
+            columns,
+            lines,
+            backlight_pin=expander.get_pin(expander.backlight_pin),
+            backlight_inverted=backlight_inverted,
+        )
 
     def _write8(self, value: int, char_mode: bool = False) -> None:
         # Sends 8b ``value`` in ``char_mode``.
@@ -131,47 +134,17 @@ class Character_LCD_I2C(Character_LCD_Mono):
         #  one ms delay to prevent writing too quickly.
         time.sleep(0.001)
 
-        if isinstance(self.expander, MCP23008):
-            # bits are, MSB (7) to LSB (0)
-            # backlight:   bit 7
-            # data line 7: bit 6
-            # data line 6: bit 5
-            # data line 5: bit 4
-            # data line 4: bit 3
-            # enable:      bit 2
-            # reset:       bit 1
-            # (unused):    bit 0
+        reset_bit = int(char_mode) << self.expander.reset_pin
+        backlight_bit = int(self.backlight ^ self.backlight_inverted) << self.expander.backlight_pin
 
-            reset_bit = int(char_mode) << 1
-            backlight_bit = int(self.backlight ^ self.backlight_inverted) << 7
+        # Write char_mode and upper 4 bits of data to the data lines.
+        self.expander.write_gpio(reset_bit | backlight_bit | self._nibble_bits[value >> 4])
 
-            # Write char_mode and upper 4 bits of data, shifted to the correct position.
-            self.__write_command(reset_bit | backlight_bit | ((value & 0xF0) >> 1))
-            self.__write_command(reset_bit | backlight_bit | ((value & 0x0F) << 3))
+        #  do command
+        self._pulse_enable()
 
-        elif isinstance(self.expander, PCF8574):
-            # bits are, MSB (7) to LSB (0)
-            # data line 7: bit 7
-            # data line 6: bit 6
-            # data line 5: bit 5
-            # data line 4: bit 4
-            # backlight:   bit 3
-            # enable:      bit 2
-            # write/read:  bit 1
-            # reset:       bit 0
-            reset_bit = int(char_mode)
-            backlight_bit = int(self.backlight ^ self.backlight_inverted) << 3
+        # Write char_mode and lower 4 bits of data to the data lines.
+        self.expander.write_gpio(reset_bit | backlight_bit | self._nibble_bits[value & 0x0F])
 
-            # Write char_mode and upper 4 bits of data, shifted to the correct position.
-            self.__write_command(reset_bit | backlight_bit | (value & 0xF0))
-            self.__write_command(reset_bit | backlight_bit | (value << 4))
-
-    def __write_command(self, value: int) -> None:
-        # Write command bits to expander.
-        if isinstance(self.expander, MCP23008):
-            self.expander.gpio = value
-        elif isinstance(self.expander, PCF8574):
-            self.expander.write_gpio(value)
-
-        # execute command
+        # do command
         self._pulse_enable()
